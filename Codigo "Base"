@@ -1,0 +1,141 @@
+
+import pandas as pd
+import requests
+import netCDF4 as nc
+import numpy as np
+from datetime import datetime
+
+# =======================================================
+# CONFIGURAÇÕES PARA O DATASET ASCAT COSTAL
+# =======================================================
+CMR_GRANULE_ENDPOINT = "https://cmr.earthdata.nasa.gov/search/granules"
+# SEU TOKEN ATUALIZADO VAI AQUI
+EARTHDATA_TOKEN = "eyJ0eXAiOiJKV1QiLCJvcmlnaW4iOiJFYXJ0aGRhdGEgTG9naW4iLCJzaWciOiJlZGxqd3RwdWJrZXlfb3BzIiwiYWxnIjoiUlMyNTYifQ.eyJ0eXBlIjoiT0F1dGgiLCJjbGllbnRfaWQiOiJPTHBBWmxFNEhxSU9NcjBUWXFnN1VRIiwiZXhwIjoxNzYyMjI1OTk4LCJpYXQiOjE3NTk2MzM5OTgsImlzcyI6Imh0dHBzOi8vdXJzLmVhcnRoZGF0YS5uYXNhLmdvdiIsInVpZCI6InNlcnJpbmhhX2phbyIsImlkZW50aXR5X3Byb3ZpZGVyIjoiZWRsX29wcyIsImFzc3VyYW5jZV9sZXZlbCI6MywiYWNyIjoiZWRsIn0.QG0-T9sLeL6rl-oFI-n3q3hdDbR7IekL_-qkwHxllMYqubf19ShE7agcM8ZoDjd3MPINEVveQ5wQ22F6TieOSX5UG47Yd2kLjkq428m0pttqxf6sDb3tlDEg7BC9woMd0cVXqwQiVqDGTG-H_xweUnLRaIEHrL-FkBdlnQysa-bQ3cwYk0z1g-_T6WbNjL8tEu16A0ykZ0Ba0jvCsxChmmAQhMorMyrPvYkPzTB_HuMie9J-dEivrenH2P1vJ1kTMgQYh_pnSA1uEHSsCYsNhvDFlaghOL9n23em_CENhfhpybATUCpGgb5mA6NIwxhnEy9QlwXt6OgYMI_93DGuNQ" 
+SHORT_NAME = "ASCATA-L2-Coastal" # Short Name do produto ASCAT Coastal
+VERSION = "1.0" 
+VARIABLE_SPEED = "wind_speed" 
+VARIABLE_DIR = "wind_dir" 
+
+# Headers de autenticação
+headers = {
+    'Authorization': f'Bearer {EARTHDATA_TOKEN}',
+    'Accept': 'application/json'
+}
+
+# =======================================================
+# SUA LISTA DE PONTOS (SUBSTITUA PELOS SEUS DADOS REAIS)
+# =======================================================
+# A lista deve ter 70 entradas. Este é um pequeno SUBSET de exemplo.
+target_points = [
+    {'date': '2010-05-15', 'lat': -31.95, 'lon': 115.86}, 
+    {'date': '2012-11-01', 'lat': -34.92, 'lon': 117.88}, 
+    {'date': '2017-09-20', 'lat': -28.00, 'lon': 114.50},
+    # ... adicione seus 70 pontos aqui ...
+]
+
+# =======================================================
+# EXTRAÇÃO DE DADOS POR PONTO
+# =======================================================
+results_list = []
+
+print(f"Iniciando extração de Vetores de Vento (ASCAT Coastal) para {len(target_points)} pontos...")
+
+for index, point in enumerate(target_points):
+    date_str = point['date']
+    lat = point['lat']
+    lon = point['lon']
+    
+    # 1. FILTRO CMR para o dia e ponto específico (BBOX centrada no ponto)
+    bbox_search = f"{lon-0.1},{lat-0.1},{lon+0.1},{lat+0.1}"
+    temporal_search = f"{date_str}T00:00:00Z,{date_str}T23:59:59Z"
+    
+    params = {
+        'short_name': SHORT_NAME,
+        'version': VERSION,
+        'temporal': temporal_search,
+        'bounding_box': bbox_search,
+        'page_size': 200, # Vários arquivos L2 podem passar no dia
+    }
+    
+    current_result = {'date': date_str, 'lat': lat, 'lon': lon, 'wind_speed': np.nan, 'wind_dir': np.nan, 'status': 'Error'}
+    
+    try:
+        search_response = requests.get(CMR_GRANULE_ENDPOINT, params=params, headers=headers)
+        search_response.raise_for_status()
+        entries = search_response.json().get('feed', {}).get('entry', [])
+        
+        if not entries:
+            current_result['status'] = 'No data (No ASCAT swath found for this day/area)'
+            print(f"   Status: 🚨 Arquivo ASCAT não encontrado para o dia {date_str}.")
+            results_list.append(current_result)
+            continue
+
+        # 2. ITERAR SOBRE OS ARQUIVOS ENCONTRADOS E EXTRAIR O MELHOR VALOR
+        best_match = None
+        
+        for entry in entries:
+            download_link = next(
+                (link['href'] for link in entry.get('links', []) if link.get('rel') == 'http://esipfed.org/ns/fedsearch/1.1/data#'),
+                None
+            )
+            
+            if download_link:
+                final_download_url = f"{download_link}?token={EARTHDATA_TOKEN}"
+                
+                # Baixa e processa o arquivo
+                file_response = requests.get(final_download_url)
+                file_response.raise_for_status()
+                file_data = file_response.content
+                
+                with nc.Dataset('in-memory-file', mode='r', memory=file_data) as ds:
+                    # ASCAT L2 tem grupos 'wvc_row' e 'wvc_col' que precisam ser combinados.
+                    # As variáveis chave estão em um grupo principal ou raiz
+                    speed_data = ds.variables[VARIABLE_SPEED][:]
+                    dir_data = ds.variables[VARIABLE_DIR][:]
+                    lat_map = ds.variables['lat'][:]
+                    lon_map = ds.variables['lon'][:]
+                    
+                    # Encontrar o ponto mais próximo no grid L2 (pode ser complexo em L2)
+                    # Simplificando para encontrar o índice mais próximo no vetor 1D
+                    
+                    # Para ASCAT L2 (que é swath), vamos achar o pixel mais próximo
+                    distance = np.sqrt((lat_map - lat)**2 + (lon_map - lon)**2)
+                    min_index = np.unravel_index(np.nanargmin(distance), distance.shape)
+                    
+                    speed_value = speed_data[min_index]
+                    dir_value = dir_data[min_index]
+                    
+                    # Se o valor não for NaN ou fill value, consideramos como melhor
+                    if not np.isnan(speed_value) and speed_value != ds.variables[VARIABLE_SPEED].get('_FillValue', -9999):
+                        best_match = (speed_value, dir_value)
+                        # Como o L2 é preciso para o momento da passagem, paramos no primeiro bom valor
+                        break 
+        
+        if best_match:
+            current_result['wind_speed'] = best_match[0]
+            current_result['wind_dir'] = best_match[1]
+            current_result['status'] = 'Success'
+            results_list.append(current_result)
+            print(f"   Status: ✅ Sucesso. Vento (Vel., Dir.): ({best_match[0]:.2f} m/s, {best_match[1]:.1f} deg)")
+        else:
+            current_result['status'] = 'No valid data in swath'
+            print("   Status: 🚨 Arquivo encontrado, mas sem pixels válidos na área (nuvens/terra).")
+            results_list.append(current_result)
+
+    except requests.exceptions.RequestException as e:
+        current_result['status'] = f'Download Error: {e.response.status_code if hasattr(e.response, "status_code") else "Unknown"}'
+        results_list.append(current_result)
+        print(f"   Status: 🚨 ERRO. Detalhes: {e}")
+    except Exception as e:
+        current_result['status'] = f'Processing Error: {e}'
+        results_list.append(current_result)
+        print(f"   Status: 🚨 ERRO. Detalhes: {e}")
+
+
+# 4. FINALIZAÇÃO E EXIBIÇÃO
+print("\n" + "="*70)
+print("EXTRAÇÃO DE VETORES DE VENTO (ASCAT) CONCLUÍDA. DATAFRAME PRONTO:")
+print("="*70)
+
+final_df = pd.DataFrame(results_list)
+print(final_df)
